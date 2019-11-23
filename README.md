@@ -59,8 +59,8 @@ POP3サーバのポート番号
 受信済みメッセージの unique id を格納したコレクション  
 メッセージが新着かそうでないかを判定するために使用される
 - use_ssl: bool (default True)  
-True のとき [poplib.POP3](https://docs.python.org/ja/3/library/poplib.html#poplib.POP3) クラスを使用する  
-False のとき [poplib.POP3_SSL](https://docs.python.org/ja/3/library/poplib.html#poplib.POP3_SSL) クラスを使用する
+True のとき [poplib.POP3_SSL](https://docs.python.org/ja/3/library/poplib.html#poplib.POP3_SSL) クラスを使用する
+False のとき [poplib.POP3](https://docs.python.org/ja/3/library/poplib.html#poplib.POP3) クラスを使用する  
 - auth_method: str (default None)  
 "apop" を指定すると認証の際 [poplib.POP3.apop](https://docs.python.org/ja/3/library/poplib.html#poplib.POP3.apop)
 または [poplib.POP3_SSL.apop](https://docs.python.org/ja/3/library/poplib.html#poplib.POP3.apop) メソッドを使用する  
