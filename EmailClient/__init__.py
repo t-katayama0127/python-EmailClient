@@ -81,6 +81,9 @@ class POP3Client:
         self.auth_method = auth_method
         self.option = option
     
+    def __del__(self):
+        self.quit()
+    
     def __enter__(self):
         self.connect()
         return self
@@ -112,6 +115,8 @@ class POP3Client:
         """
         try:
             self.pop3.quit()
+        except:
+            pass
         finally:
             self.pop3 = None
 
