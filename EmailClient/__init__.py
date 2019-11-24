@@ -1,7 +1,9 @@
 import poplib
 import email
 from email.header import decode_header, make_header
-from typing import Iterable
+import logging
+from typing import Iterable, Callable
+import functools
 
 __all__ = ["parse_email", "POP3Client", "MAIL_HEADER_NAMES"]
 
@@ -62,28 +64,32 @@ class POP3Client:
         use_ssl: True のとき POP3_SSL を使う
         auth_method: 認証にAPOPまたはRPOPを使用するとき、"apop" または "rpop" を指定する)
         option: poplib.POP3 または poplib.POP3_SSL コンストラクタに渡す host, port 以外の引数の辞書
+        logger: pop3通信を行ったときのサーバからのメッセージをログとして記録するLogger
     """
-    def __init__(self, user: str, password: str,
-                 host: str, port: int = None, old_uid: Iterable = None,
-                 use_ssl: bool = True, auth_method: str = None, option: dict = {}):
+    def __init__(self, user: str, password: str, host: str,
+                 port: int = None, old_uid: Iterable = None, use_ssl: bool = True,
+                 auth_method: str = None, option: dict = {}, logger: logging.Logger = None):
         self.host = host
-        if port:
-            self.port = port
-        elif use_ssl:
-            self.port = poplib.POP3_SSL_PORT
+        if use_ssl:
+            self.port = port if port else poplib.POP3_SSL_PORT
+            self.pop3_cls = POP3_SSL_plus_logging
         else:
-            self.port = poplib.POP3_PORT
+            self.port = port if port else poplib.POP3_PORT
+            self.pop3_cls = POP3_plus_logging
         self.user = user
         self.password = password
         self.old_uid = set(old_uid) if old_uid else set()
         self.pop3 = None
-        self.pop3_cls = poplib.POP3_SSL if use_ssl else poplib.POP3
         self.auth_method = auth_method
         self.option = option
-    
+        self.logger = logger if logger else self._get_default_logger()
+
     def __del__(self):
-        self.quit()
-    
+        try:
+            self.quit()
+        except Exception:
+            pass
+
     def __enter__(self):
         self.connect()
         return self
@@ -95,7 +101,7 @@ class POP3Client:
         """
         POP3オブジェクトを作成し、認証を行う
         """
-        self.pop3 = self.pop3_cls(self.host, self.port, **self.option)
+        self.pop3 = self.pop3_cls(self.host, self.port, logger=self.logger, **self.option)
         try:
             if self.auth_method == "apop":
                 self.pop3.apop(self.user, self.password)
@@ -111,14 +117,10 @@ class POP3Client:
 
     def quit(self):
         """
-        POP3接続を閉じ、サーバの受信ボックスのロックを解除する
+        POP3接続を閉じ、変更をコミットし、サーバの受信ボックスのロックを解除する
         """
-        try:
-            self.pop3.quit()
-        except:
-            pass
-        finally:
-            self.pop3 = None
+        self.pop3.quit()
+        self.pop3 = None
 
     def get_all_unique_id(self) -> dict:
         """
@@ -127,7 +129,7 @@ class POP3Client:
         Returns:
             {unique_id: message_number, ...}
         """
-        all_uid = map(self.parse_unique_id, self.pop3.uidl()[1])
+        all_uid = map(self._parse_unique_id, self.pop3.uidl()[1])
         return {x[0]: x[1] for x in all_uid}
 
     def get_new_unique_id(self) -> dict:
@@ -152,7 +154,7 @@ class POP3Client:
         """
         msg_dict = {}
         for uid, msg_no in uid_dict.items():
-            msg_dict[uid] = self.parse_message(self.pop3.retr(msg_no))
+            msg_dict[uid] = self._parse_message(self.pop3.retr(msg_no))
         self.old_uid |= msg_dict.keys()
         return msg_dict
 
@@ -174,7 +176,21 @@ class POP3Client:
         """
         return self.get_messages(self.get_new_unique_id())
 
-    def parse_unique_id(self, uid_bytes: bytes) -> (str, int):
+    def delete_messages(self, uid_list: Iterable):
+        """
+        uid_list に指定されたメッセージに削除フラグを立てる
+        ---
+        Parameters:
+            uid_list: 削除するメッセージのユニークIDを格納したIterable
+        """
+
+    def undo_delete(self):
+        """
+        削除フラグをすべて取り消す
+        """
+        self.pop3.rset()
+
+    def _parse_unique_id(self, uid_bytes: bytes) -> (str, int):
         """
         POP3.uidl の2番目の戻り値の要素をパースした結果を戻す
         ---
@@ -188,7 +204,7 @@ class POP3Client:
         msg_no = int(msg_no)
         return uid, msg_no
 
-    def parse_message(self, retr_result: tuple) -> dict:
+    def _parse_message(self, retr_result: tuple) -> dict:
         """
         POP3.retr の戻り値をパースした結果を戻す
         ---
@@ -200,3 +216,81 @@ class POP3Client:
         """
         msg = b'\r\n'.join(retr_result[1])
         return parse_email(msg)
+
+    def _get_default_logger(self):
+        logger = logging.getLogger(f'POP3/{self.host}/{self.user}')
+        logger.setLevel('INFO')
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(fmt="%(levelname)s\t%(asctime)s\t%(name)s\t%(message)s",
+                                          datefmt="%Y-%m-%d %H:%M:%S")
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+        return logger
+
+
+def add_POP3_res_logging(func) -> Callable:
+    """
+    POP3, POP3_SSLクラスのサーバ問い合わせメソッドに、
+    サーバからのレスポンスをself.loggerに渡す処理を追加するデコレータ
+    """
+    if not callable(func):
+        return func
+
+    if func.__name__ in ('getwelcome', 'user', 'pass_', 'dele',
+                         'noop', 'rset', 'quit', 'rpop', 'apop', 'utf8', 'stls'):
+        def get_message(result):
+            return result.decode()
+    elif func.__name__ in ('retr', 'top'):
+        def get_message(result):
+            return result[0].decode()
+    elif func.__name__ in ('capa',):
+        def get_message(result):
+            return str(result)
+    elif func.__name__ in ('list', 'uidl'):
+        def get_message(result):
+            return result[0].decode() if isinstance(result, tuple) else result.decode()
+    elif func.__name__ in ('stat',):
+        def get_message(result):
+            return f'massage_count={result[0]}, mailbox_size={result[1]}'
+    else:
+        return func
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        try:
+            result = func(self, *args, **kwargs)
+            msg = get_message(result)
+            if msg:
+                self.logger.info(f"{wrapper.__name__} -> {msg}")
+            return result
+        except poplib.error_proto as e:
+            self.logger.error(e.args[0].decode())
+            raise
+        except Exception:
+            self.logger.exception('UnexpectedError')
+            raise
+
+    return wrapper
+
+
+class POP3_plus_logging_meta(type):
+    def __new__(cls, classname, bases, attributes):
+        instance = super().__new__(cls, classname, bases, attributes)
+        for attr in dir(instance):
+            value = getattr(instance, attr)
+            if callable(value):
+                setattr(instance, attr, add_POP3_res_logging(value))
+        return instance
+
+
+class POP3_plus_logging(poplib.POP3, metaclass=POP3_plus_logging_meta):
+    def __init__(self, *args, logger, **kwargs):
+        self.logger = logger
+        super().__init__(*args, **kwargs)
+
+
+class POP3_SSL_plus_logging(poplib.POP3_SSL, metaclass=POP3_plus_logging_meta):
+    def __init__(self, *args, logger, **kwargs):
+        self.logger = logger
+        super().__init__(*args, **kwargs)
